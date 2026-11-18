@@ -37,5 +37,29 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_business
                 ON chunks(business_id);
+
+            CREATE TABLE IF NOT EXISTS leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                interest TEXT,
+                status TEXT NOT NULL DEFAULT 'new',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_leads_business
+                ON leads(business_id);
+
+            CREATE TABLE IF NOT EXISTS followups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL REFERENCES leads(id),
+                step INTEGER NOT NULL,
+                due_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                message TEXT,
+                sent_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_followups_lead
+                ON followups(lead_id);
             """
         )
