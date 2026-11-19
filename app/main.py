@@ -1,9 +1,21 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from app.businesses import (
+    authorize,
+    business_exists,
+    check_master_key,
+    hash_key,
+    init_businesses,
+    make_business_id,
+    new_api_key,
+)
 from app.chunking import chunk_text
 from app.db import get_conn, init_db
 from app.followups import (
@@ -13,7 +25,10 @@ from app.followups import (
     schedule_followups,
     utcnow,
 )
+from app.ratelimit import RateLimiter
 from app.search import search
+
+STATIC = Path(__file__).parent / "static"
 
 # A passage must contain at least this share of the question's key words.
 MIN_COVERAGE = 0.6
@@ -23,14 +38,44 @@ NOT_FOUND_MESSAGE = (
 LEAD_STATUSES = ("new", "replied", "converted", "lost")
 FOLLOWUP_STATUSES = ("pending", "sent", "cancelled", "skipped")
 
+# Public endpoints (the chat widget): 30 calls per minute per visitor.
+limiter = RateLimiter(max_calls=30, window_seconds=60)
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def public_rate_limit(request: Request) -> None:
+    if not limiter.allow(f"{request.url.path}:{client_ip(request)}"):
+        raise HTTPException(
+            status_code=429, detail="Too many requests. Please try again soon."
+        )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    with get_conn() as conn:
+        init_businesses(conn)
     yield
 
 
-app = FastAPI(title="Catchly", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Catchly", version="0.4.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["*"],
+)
+
+
+class BusinessIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
 
 
 class DocumentIn(BaseModel):
@@ -56,43 +101,30 @@ class LeadStatusIn(BaseModel):
     status: Literal["new", "replied", "converted", "lost"]
 
 
+# ---------- public ----------
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "catchly"}
 
 
-@app.post("/documents", status_code=201)
-def add_document(body: DocumentIn) -> dict:
-    chunks = chunk_text(body.text)
-    if not chunks:
-        raise HTTPException(status_code=422, detail="Document text is empty.")
-
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO documents (business_id, title) VALUES (?, ?)",
-            (body.business_id, body.title),
-        )
-        doc_id = cur.lastrowid
-        conn.executemany(
-            "INSERT INTO chunks (document_id, business_id, position, text) "
-            "VALUES (?, ?, ?, ?)",
-            [(doc_id, body.business_id, i, c) for i, c in enumerate(chunks)],
-        )
-    return {"document_id": doc_id, "title": body.title, "chunks": len(chunks)}
+@app.get("/widget.js", include_in_schema=False)
+def widget_js():
+    return FileResponse(STATIC / "widget.js", media_type="application/javascript")
 
 
-@app.get("/documents")
-def list_documents(business_id: str) -> dict:
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT id, title, created_at FROM documents "
-            "WHERE business_id = ? ORDER BY id",
-            (business_id,),
-        ).fetchall()
-    return {"documents": [dict(r) for r in rows]}
+@app.get("/panel", include_in_schema=False)
+def panel():
+    return FileResponse(STATIC / "dashboard.html", media_type="text/html")
 
 
-@app.post("/ask")
+@app.get("/demo", include_in_schema=False)
+def demo():
+    return FileResponse(STATIC / "demo.html", media_type="text/html")
+
+
+@app.post("/ask", dependencies=[Depends(public_rate_limit)])
 def ask(body: AskIn) -> dict:
     with get_conn() as conn:
         rows = conn.execute(
@@ -127,10 +159,12 @@ def ask(body: AskIn) -> dict:
     }
 
 
-@app.post("/leads", status_code=201)
+@app.post("/leads", status_code=201, dependencies=[Depends(public_rate_limit)])
 def create_lead(body: LeadIn) -> dict:
     now = utcnow()
     with get_conn() as conn:
+        if not business_exists(conn, body.business_id):
+            raise HTTPException(status_code=404, detail="Unknown business.")
         cur = conn.execute(
             "INSERT INTO leads (business_id, name, phone, interest, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -141,9 +175,75 @@ def create_lead(body: LeadIn) -> dict:
     return {"lead_id": lead_id, "status": "new", "followups_scheduled": 3}
 
 
-@app.get("/leads")
-def list_leads(business_id: str) -> dict:
+# ---------- admin (server owner) ----------
+
+
+@app.post("/businesses", status_code=201)
+def create_business(
+    body: BusinessIn, x_admin_key: str | None = Header(default=None)
+) -> dict:
+    check_master_key(x_admin_key)
+    business_id = make_business_id(body.name)
+    api_key = new_api_key()
     with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO businesses (id, name, api_key_hash, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (business_id, body.name, hash_key(api_key), fmt(utcnow())),
+        )
+    return {
+        "business_id": business_id,
+        "name": body.name,
+        "api_key": api_key,
+        "note": "Save this API key now. It is shown only once.",
+    }
+
+
+# ---------- private (business API key) ----------
+
+
+@app.post("/documents", status_code=201)
+def add_document(
+    body: DocumentIn, x_api_key: str | None = Header(default=None)
+) -> dict:
+    with get_conn() as conn:
+        authorize(conn, body.business_id, x_api_key)
+        chunks = chunk_text(body.text)
+        if not chunks:
+            raise HTTPException(status_code=422, detail="Document text is empty.")
+        cur = conn.execute(
+            "INSERT INTO documents (business_id, title) VALUES (?, ?)",
+            (body.business_id, body.title),
+        )
+        doc_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO chunks (document_id, business_id, position, text) "
+            "VALUES (?, ?, ?, ?)",
+            [(doc_id, body.business_id, i, c) for i, c in enumerate(chunks)],
+        )
+    return {"document_id": doc_id, "title": body.title, "chunks": len(chunks)}
+
+
+@app.get("/documents")
+def list_documents(
+    business_id: str, x_api_key: str | None = Header(default=None)
+) -> dict:
+    with get_conn() as conn:
+        authorize(conn, business_id, x_api_key)
+        rows = conn.execute(
+            "SELECT id, title, created_at FROM documents "
+            "WHERE business_id = ? ORDER BY id",
+            (business_id,),
+        ).fetchall()
+    return {"documents": [dict(r) for r in rows]}
+
+
+@app.get("/leads")
+def list_leads(
+    business_id: str, x_api_key: str | None = Header(default=None)
+) -> dict:
+    with get_conn() as conn:
+        authorize(conn, business_id, x_api_key)
         rows = conn.execute(
             "SELECT id, name, phone, interest, status, created_at "
             "FROM leads WHERE business_id = ? ORDER BY id DESC",
@@ -153,8 +253,13 @@ def list_leads(business_id: str) -> dict:
 
 
 @app.patch("/leads/{lead_id}")
-def update_lead(lead_id: int, body: LeadStatusIn) -> dict:
+def update_lead(
+    lead_id: int,
+    body: LeadStatusIn,
+    x_api_key: str | None = Header(default=None),
+) -> dict:
     with get_conn() as conn:
+        authorize(conn, body.business_id, x_api_key)
         lead = conn.execute(
             "SELECT id FROM leads WHERE id = ? AND business_id = ?",
             (lead_id, body.business_id),
@@ -171,20 +276,26 @@ def update_lead(lead_id: int, body: LeadStatusIn) -> dict:
 
 
 @app.post("/followups/run")
-def run_followups(business_id: str) -> dict:
+def run_followups(
+    business_id: str, x_api_key: str | None = Header(default=None)
+) -> dict:
     """Return follow-up messages that are due, and mark them as sent.
 
-    Catchly does not deliver them yet. A person or a later integration
-    (WhatsApp, email) sends each message to the lead's phone.
+    Catchly does not deliver them. The panel gives staff a WhatsApp link
+    with the text ready to send.
     """
     with get_conn() as conn:
+        authorize(conn, business_id, x_api_key)
         sent = run_due(conn, business_id, utcnow())
     return {"count": len(sent), "messages": sent}
 
 
 @app.get("/dashboard")
-def dashboard(business_id: str) -> dict:
+def dashboard(
+    business_id: str, x_api_key: str | None = Header(default=None)
+) -> dict:
     with get_conn() as conn:
+        authorize(conn, business_id, x_api_key)
         lead_rows = conn.execute(
             "SELECT status, COUNT(*) AS n FROM leads "
             "WHERE business_id = ? GROUP BY status",
